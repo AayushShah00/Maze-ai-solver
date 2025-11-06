@@ -1,0 +1,259 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset, Dataset
+import torchvision
+import torchvision.transforms as transforms
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+# Set a random seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+# --- 1. ResNet Building Blocks (Corrected BasicBlock) ---
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x) 
+        out = F.relu(out)
+        return out
+
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=8):
+        super(ResNet, self).__init__()
+        self.in_planes = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        self.linear = nn.Linear(512 * block.expansion, num_classes)
+        self.dropout = nn.Dropout(0.3)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.dropout(out)
+        out = self.linear(out)
+        return out
+
+def ResNet18(num_classes=8):
+    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+
+# -----------------------------------------------------------
+
+# --- 2. CIFAR-8 Data Loading and Preprocessing (with Dynamic Augmentation) ---
+
+# Define data transformations for the TEST/VALIDATION set
+transform_test = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+])
+
+# Define data transformations for the TRAINING set (Random Augmentation)
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+])
+
+
+print("Downloading and loading CIFAR-10 data...")
+trainset_cifar10_aug = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                                download=True, transform=transform_train)
+trainset_cifar10_no_aug = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                                download=True, transform=transform_test)
+testset_cifar10 = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                               download=True, transform=transform_test)
+print("Data loaded.")
+
+TARGET_CLASSES = list(range(8))
+cifar10_classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+cifar8_class_names = [cifar10_classes[i] for i in TARGET_CLASSES]
+
+# Custom Dataset Class for Filtering and Dynamic Labeling
+class FilteredDataset(Dataset):
+    def __init__(self, original_dataset, target_classes):
+        self.original_dataset = original_dataset
+        label_map = {old_label: new_label for new_label, old_label in enumerate(target_classes)}
+        
+        self.indices = []
+        self.new_targets = []
+        for i, label in enumerate(original_dataset.targets):
+            if label in target_classes:
+                self.indices.append(i)
+                self.new_targets.append(label_map[label])
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        img, _ = self.original_dataset[self.indices[idx]]
+        return img, self.new_targets[idx]
+
+# Create the filtered datasets
+train_cifar8_ds_aug = FilteredDataset(trainset_cifar10_aug, TARGET_CLASSES)
+train_cifar8_ds_no_aug = FilteredDataset(trainset_cifar10_no_aug, TARGET_CLASSES)
+test_cifar8_ds = FilteredDataset(testset_cifar10, TARGET_CLASSES)
+
+
+# --- Splitting Logic using Indices ---
+full_indices = list(range(len(train_cifar8_ds_aug)))
+full_targets = train_cifar8_ds_aug.new_targets
+
+train_indices, val_indices, _, _ = train_test_split(
+    full_indices, full_targets, test_size=0.2, random_state=42, stratify=full_targets
+)
+
+train_dataset = Subset(train_cifar8_ds_aug, train_indices)
+val_dataset = Subset(train_cifar8_ds_no_aug, val_indices) # Val uses non-augmented data
+
+BATCH_SIZE = 128
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_cifar8_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+# -----------------------------------------------------------
+
+# --- 3. Model Initialization and Training Setup ---
+
+model = ResNet18(num_classes=8)
+criterion = nn.CrossEntropyLoss()
+
+# Recommended training settings for high-accuracy CIFAR training:
+INITIAL_LR = 0.1
+MOMENTUM = 0.9
+L2_WEIGHT_DECAY = 5e-4 
+NUM_EPOCHS = 100 # Increased epochs for better convergence with augmentation and scheduling
+
+# Use SGD with Momentum and L2 Regularization (Weight Decay)
+optimizer = optim.SGD(model.parameters(), 
+                      lr=INITIAL_LR, 
+                      momentum=MOMENTUM, 
+                      weight_decay=L2_WEIGHT_DECAY)
+
+# Use Cosine Annealing Scheduler
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+
+
+train_loss_history = []
+val_loss_history = []
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+print(f"Starting training on device: {device}")
+
+# --- 4. Training Loop ---
+for epoch in range(NUM_EPOCHS):
+    # Training
+    model.train()
+    running_loss = 0.0
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * inputs.size(0)
+    
+    # Step the scheduler *after* the epoch
+    scheduler.step()
+    
+    train_loss = running_loss / len(train_loader.dataset)
+    train_loss_history.append(train_loss)
+
+    # Validation
+    model.eval()
+    running_val_loss = 0.0
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            running_val_loss += loss.item() * inputs.size(0)
+    val_loss = running_val_loss / len(val_loader.dataset)
+    val_loss_history.append(val_loss)
+
+    print(f'Epoch {epoch+1}/{NUM_EPOCHS}, LR: {optimizer.param_groups[0]["lr"]:.6f}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+
+print("Training complete.")
+
+# --- 5. Evaluation on Test Set ---
+print("\n- Evaluation on Test Set -")
+model.eval()
+y_true = []
+y_pred = []
+
+with torch.no_grad():
+    correct = 0
+    total = 0
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = model(inputs)
+        _, predicted = torch.max(outputs.data, 1)
+        
+        preds = predicted.cpu().numpy()
+        labels_np = labels.cpu().numpy()
+        
+        y_true.extend(labels_np)
+        y_pred.extend(preds)
+        
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+
+print(f'Test Accuracy of the model on the 8000 test images: {100 * correct / total:.2f} %')
+print("\nClassification Report:")
+print(classification_report(y_true, y_pred, target_names=cifar8_class_names, zero_division=0))
+
+
+# --- 6. Plotting Results ---
+plt.figure(figsize=(10, 5))
+plt.plot(train_loss_history, label='Training Loss')
+plt.plot(val_loss_history, label='Validation Loss')
+plt.title("Deep ResNet Training and Validation Loss Curve (CIFAR-8)")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.grid(True)
+plt.legend()
+plt.show()
+#this is a cifar 10 resnet.
